@@ -332,6 +332,12 @@ def get_role():
             "SELECT status FROM teachers WHERE telegram_id = ?", (user_id,)
         )
         if teacher:
+            if teacher.get("status") == "approved":
+                return "teacher"
+            if teacher.get("status") == "pending":
+                return "pending_teacher"
+            if teacher.get("status") == "rejected":
+                return "rejected_teacher"
             return "teacher"
     except Exception as e:
         print(f"get_role error: {e}")
@@ -430,9 +436,13 @@ def send_telegram_message(chat_id, text):
 @app.route("/")
 def home():
     role = get_role()
-    if not role:
-        return render_template_string(UNAUTHORIZED_HTML, user_id=uid() or "—"), 403
-    return render_template_string(HTML, user_id=uid(), user_role=role)
+    # Always render the main app. Unregistered users get the registration UI.
+    # Admin is recognized purely by ADMIN_ID (no registration needed).
+    return render_template_string(
+        HTML,
+        user_id=uid() or "",
+        user_role=role or "",
+    )
 
 
 # ============================================================
@@ -1029,6 +1039,163 @@ def teacher_status(teacher_id):
         return jsonify(ok=True)
     except Exception as e:
         return jsonify(error=str(e)), 500
+
+
+# ============================================================
+# SELF-REGISTRATION (open to everyone with Telegram ID)
+# ============================================================
+
+@app.route("/api/register/student", methods=["POST"])
+def register_student():
+    """Students self-register using a section registration code."""
+    user_id = uid()
+    if not user_id:
+        return jsonify(error="Telegram ID is required. Open the app from Telegram."), 401
+    if user_id == ADMIN_ID:
+        return jsonify(error="Admin account cannot register as student."), 400
+    if one("SELECT 1 FROM students WHERE telegram_id = ?", (user_id,)):
+        return jsonify(error="You are already registered as a student."), 400
+    if one("SELECT 1 FROM teachers WHERE telegram_id = ?", (user_id,)):
+        return jsonify(error="This Telegram account is already registered as a teacher."), 400
+
+    d = request.get_json(silent=True) or {}
+    name = str(d.get("name", "")).strip()
+    sex = str(d.get("sex", "")).strip().upper()
+    student_id = str(d.get("student_id", "")).strip() or None
+    code = str(d.get("registration_code", "")).strip().upper()
+
+    if not name or len(name) < 2:
+        return jsonify(error="Full name is required (at least 2 characters)."), 400
+    if sex and sex not in ("M", "F", "MALE", "FEMALE"):
+        return jsonify(error="Sex must be M or F."), 400
+    if sex in ("MALE", "M"):
+        sex = "M"
+    elif sex in ("FEMALE", "F"):
+        sex = "F"
+    if not code:
+        return jsonify(error="Registration code is required (ask your school for the class code)."), 400
+
+    # Find class by registration code
+    ensure_registration_codes()
+    rc = one("""
+        SELECT rc.class_id, rc.status, c.name AS class_name, c.academic_year_id, c.grade, c.section
+        FROM section_registration_codes rc
+        JOIN school_classes c ON c.id = rc.class_id
+        WHERE UPPER(rc.code) = ?
+    """, (code,))
+    if not rc:
+        return jsonify(error="Invalid registration code. Check with your school."), 400
+    if rc.get("status") != "active":
+        return jsonify(error="This registration code is no longer active."), 400
+
+    # Optional uniqueness of student_id
+    if student_id:
+        existing = one("SELECT telegram_id FROM students WHERE student_id = ?", (student_id,))
+        if existing and str(existing["telegram_id"]) != str(user_id):
+            return jsonify(error="This student ID is already used by another student."), 400
+
+    try:
+        run("""
+            INSERT INTO students
+                (telegram_id, student_id, name, sex, class_id, class_name, academic_year_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            user_id,
+            student_id or user_id,  # fallback to telegram id if no student_id given
+            name,
+            sex or None,
+            rc["class_id"],
+            rc["class_name"],
+            rc["academic_year_id"],
+            now(),
+        ))
+        return jsonify(
+            ok=True,
+            message=f"Registered successfully as student in {rc['class_name']}.",
+            class_name=rc["class_name"],
+        )
+    except sqlite3.IntegrityError as e:
+        return jsonify(error="Registration conflict: " + str(e)), 400
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
+@app.route("/api/register/teacher", methods=["POST"])
+def register_teacher():
+    """Teachers self-register; status starts as pending until admin approves."""
+    user_id = uid()
+    if not user_id:
+        return jsonify(error="Telegram ID is required. Open the app from Telegram."), 401
+    if user_id == ADMIN_ID:
+        return jsonify(error="Admin account cannot register as teacher."), 400
+    if one("SELECT 1 FROM teachers WHERE telegram_id = ?", (user_id,)):
+        return jsonify(error="You are already registered as a teacher."), 400
+    if one("SELECT 1 FROM students WHERE telegram_id = ?", (user_id,)):
+        return jsonify(error="This Telegram account is already registered as a student."), 400
+
+    d = request.get_json(silent=True) or {}
+    name = str(d.get("name", "")).strip()
+    phone = str(d.get("phone", "")).strip() or None
+    teacher_id = str(d.get("teacher_id", "")).strip() or None
+
+    if not name or len(name) < 2:
+        return jsonify(error="Full name is required (at least 2 characters)."), 400
+
+    if teacher_id:
+        existing = one("SELECT telegram_id FROM teachers WHERE teacher_id = ?", (teacher_id,))
+        if existing and str(existing["telegram_id"]) != str(user_id):
+            return jsonify(error="This teacher ID is already used by another teacher."), 400
+
+    try:
+        run("""
+            INSERT INTO teachers
+                (telegram_id, teacher_id, name, phone, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+        """, (
+            user_id,
+            teacher_id or user_id,
+            name,
+            phone,
+            now(),
+        ))
+        # Notify admin (optional, free)
+        send_telegram_message(
+            ADMIN_ID,
+            f"👨‍🏫 New teacher registration pending approval:\n"
+            f"Name: {name}\n"
+            f"TG ID: {user_id}\n"
+            f"Teacher ID: {teacher_id or user_id}\n"
+            f"Open the Mini App → Teachers to approve.",
+        )
+        return jsonify(
+            ok=True,
+            message="Registration submitted. Waiting for admin approval.",
+            status="pending",
+        )
+    except sqlite3.IntegrityError as e:
+        return jsonify(error="Registration conflict: " + str(e)), 400
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
+@app.route("/api/register/status")
+def register_status():
+    """Lightweight check so the frontend knows what to show."""
+    user_id = uid()
+    if not user_id:
+        return jsonify(registered=False, role=None, message="No Telegram ID")
+    role = get_role()
+    if role == "admin":
+        return jsonify(registered=True, role="admin")
+    if role == "student":
+        return jsonify(registered=True, role="student")
+    if role == "teacher":
+        return jsonify(registered=True, role="teacher", status="approved")
+    if role == "pending_teacher":
+        return jsonify(registered=True, role="teacher", status="pending")
+    if role == "rejected_teacher":
+        return jsonify(registered=True, role="teacher", status="rejected")
+    return jsonify(registered=False, role=None)
 
 
 # ============================================================
@@ -1670,12 +1837,13 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);line-height:
 header{background:linear-gradient(180deg,#0c1220,#0a0e17);padding:14px 18px;position:sticky;top:0;z-index:60;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;backdrop-filter:blur(12px)}
 .logo{width:36px;height:36px;background:linear-gradient(135deg,#0e7490,#4f46e5);border-radius:11px;display:grid;place-items:center;font-size:16px;box-shadow:0 4px 14px rgba(14,116,144,.35);flex-shrink:0}
 header h1{font-size:1.1rem;font-weight:700;letter-spacing:-.02em;background:linear-gradient(90deg,#f1f5f9,#94a3b8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-nav{display:flex;gap:6px;overflow-x:auto;background:var(--bg2);padding:10px 12px;position:sticky;top:57px;z-index:50;border-bottom:1px solid var(--border);scrollbar-width:none}
+nav{display:flex!important;gap:6px;overflow-x:auto;background:var(--bg2);padding:10px 12px;position:sticky;top:57px;z-index:50;border-bottom:1px solid var(--border);scrollbar-width:none;visibility:visible!important;opacity:1!important;min-height:44px}
 nav::-webkit-scrollbar{display:none}
-nav button{background:transparent;color:var(--muted);border:1px solid transparent;border-radius:999px;padding:8px 14px;white-space:nowrap;font-weight:600;font-size:12.5px;cursor:pointer;transition:all .18s;font-family:inherit}
+nav button{background:transparent;color:var(--muted);border:1px solid transparent;border-radius:999px;padding:8px 14px;white-space:nowrap;font-weight:600;font-size:12.5px;cursor:pointer;transition:all .18s;font-family:inherit;visibility:visible!important;opacity:1!important}
 nav button:hover{color:var(--text2);background:var(--card)}
 nav button.active{background:linear-gradient(135deg,#0e7490,#6366f1);color:#fff;border-color:transparent;box-shadow:0 4px 12px rgba(99,102,241,.3)}
-main{max-width:720px;margin:0 auto;padding:16px 14px 90px}
+main{max-width:720px;margin:0 auto;padding:16px 14px 90px;visibility:visible!important;opacity:1!important;min-height:40vh}
+.card,.hero,.tablewrap,table,.lesson,.grid,.stat{visibility:visible!important;opacity:1!important}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:14px;box-shadow:var(--shadow);transition:border-color .2s}
 .card:hover{border-color:var(--border-light)}
 .hero{background:linear-gradient(145deg,#151b2d 0%,#1a1040 50%,#0c1220 100%);border-radius:20px;padding:22px 20px;margin-bottom:16px;border:1px solid rgba(99,102,241,.2);position:relative;overflow:hidden}
@@ -2679,6 +2847,179 @@ const adminSections = {
   years: "📅 Years", reports: "📈 Reports", backup: "💾 Backup"
 };
 
+/* ========== REGISTRATION UI (open to everyone) ========== */
+function showRegisterChoice() {
+  document.getElementById("nav").innerHTML = "";
+  document.getElementById("app").innerHTML = `
+    <div class="hero">
+      <h2>Welcome 👋</h2>
+      <p>Choose how you want to join the school system</p>
+    </div>
+    <div class="card" style="text-align:center;padding:28px 20px">
+      <p class="muted" style="margin-bottom:18px">Your Telegram ID will become your account ID after registration.</p>
+      <div style="display:flex;flex-direction:column;gap:12px;max-width:280px;margin:0 auto">
+        <button onclick="showStudentRegister()" style="padding:16px">👨‍🎓 Register as Student</button>
+        <button class="alt" onclick="showTeacherRegister()" style="padding:16px">👨‍🏫 Register as Teacher</button>
+      </div>
+      <p class="muted" style="margin-top:20px;font-size:12px">
+        Students register instantly with a class code.<br>
+        Teachers wait for admin approval.
+      </p>
+    </div>`;
+}
+
+function showStudentRegister() {
+  document.getElementById("nav").innerHTML = "";
+  document.getElementById("app").innerHTML = `
+    <div class="hero">
+      <h2>Student Registration</h2>
+      <p>Self-register using your class registration code</p>
+    </div>
+    <div class="card">
+      <form onsubmit="submitStudentRegister(event)">
+        <div class="formgrid">
+          <div style="grid-column:1/-1">
+            <label>Full Name</label>
+            <input name="name" placeholder="Your full name" required minlength="2">
+          </div>
+          <div>
+            <label>Sex</label>
+            <select name="sex">
+              <option value="">Optional</option>
+              <option value="M">Male</option>
+              <option value="F">Female</option>
+            </select>
+          </div>
+          <div>
+            <label>Student ID (optional)</label>
+            <input name="student_id" placeholder="School student ID">
+          </div>
+          <div style="grid-column:1/-1">
+            <label>Class Registration Code</label>
+            <input name="registration_code" placeholder="e.g. G6A-2024" required
+              style="text-transform:uppercase;letter-spacing:1px;font-weight:650">
+            <p class="muted" style="font-size:11px;margin-top:2px">
+              Ask your school / class teacher for the code of your section.
+            </p>
+          </div>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px">
+          <button type="submit">✅ Register as Student</button>
+          <button type="button" class="alt" onclick="showRegisterChoice()">← Back</button>
+        </div>
+      </form>
+    </div>`;
+}
+
+function showTeacherRegister() {
+  document.getElementById("nav").innerHTML = "";
+  document.getElementById("app").innerHTML = `
+    <div class="hero">
+      <h2>Teacher Registration</h2>
+      <p>Submit your details — admin will approve</p>
+    </div>
+    <div class="card">
+      <form onsubmit="submitTeacherRegister(event)">
+        <div class="formgrid">
+          <div style="grid-column:1/-1">
+            <label>Full Name</label>
+            <input name="name" placeholder="Your full name" required minlength="2">
+          </div>
+          <div>
+            <label>Phone (optional)</label>
+            <input name="phone" placeholder="+251…">
+          </div>
+          <div>
+            <label>Teacher ID (optional)</label>
+            <input name="teacher_id" placeholder="School teacher ID">
+          </div>
+        </div>
+        <div class="info-box" style="margin:12px 0">
+          After you submit, your account stays <b>pending</b> until the admin approves you in the Teachers tab.
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap">
+          <button type="submit">📤 Submit for Approval</button>
+          <button type="button" class="alt" onclick="showRegisterChoice()">← Back</button>
+        </div>
+      </form>
+    </div>`;
+}
+
+async function submitStudentRegister(e) {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const payload = {
+    name: fd.get("name"),
+    sex: fd.get("sex") || "",
+    student_id: fd.get("student_id") || "",
+    registration_code: (fd.get("registration_code") || "").toUpperCase().trim()
+  };
+  try {
+    toast("Registering…");
+    const res = await api("/api/register/student", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    toast(res.message || "Registered successfully!");
+    setTimeout(() => location.reload(), 1200);
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+async function submitTeacherRegister(e) {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const payload = {
+    name: fd.get("name"),
+    phone: fd.get("phone") || "",
+    teacher_id: fd.get("teacher_id") || ""
+  };
+  try {
+    toast("Submitting…");
+    const res = await api("/api/register/teacher", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+    toast(res.message || "Submitted for approval");
+    setTimeout(() => location.reload(), 1200);
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+function showPendingTeacher() {
+  document.getElementById("nav").innerHTML = "";
+  document.getElementById("app").innerHTML = `
+    <div class="hero">
+      <h2>⏳ Pending Approval</h2>
+      <p>Your teacher registration is waiting for admin approval</p>
+    </div>
+    <div class="card" style="text-align:center;padding:28px 20px">
+      <div class="icon" style="margin:0 auto 16px;width:56px;height:56px;background:var(--warning-bg);border-radius:16px;display:grid;place-items:center;font-size:24px">⏳</div>
+      <p>You have successfully registered as a teacher.</p>
+      <p class="muted" style="margin-top:10px">Please wait until the school admin approves your account.<br>
+      You will be able to use the app after approval.</p>
+      <button class="alt" style="margin-top:18px" onclick="location.reload()">🔄 Check again</button>
+    </div>`;
+}
+
+function showRejectedTeacher() {
+  document.getElementById("nav").innerHTML = "";
+  document.getElementById("app").innerHTML = `
+    <div class="hero">
+      <h2>Registration Rejected</h2>
+      <p>Your teacher application was not approved</p>
+    </div>
+    <div class="card" style="text-align:center;padding:28px 20px">
+      <p>Please contact the school admin for more information.</p>
+      <button class="alt" style="margin-top:18px" onclick="location.reload()">🔄 Check again</button>
+    </div>`;
+}
+
+/* ========== BOOT ========== */
 if (ROLE === "admin") {
   setNav(Object.entries(adminSections));
   show("dashboard");
@@ -2692,6 +3033,13 @@ if (ROLE === "admin") {
     ["teacherAssessments", "📝 Assessments"]
   ]);
   show("teacherHome");
+} else if (ROLE === "pending_teacher") {
+  showPendingTeacher();
+} else if (ROLE === "rejected_teacher") {
+  showRejectedTeacher();
+} else {
+  // No role yet → open registration (works for any visitor with Telegram ID)
+  showRegisterChoice();
 }
 </script>
 </body>
