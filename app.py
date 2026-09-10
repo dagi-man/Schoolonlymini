@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-School Academic Management Mini App — Premium Edition
-=====================================================
-Telegram Mini App with automatic user detection, premium UI,
-clean assessment workflow, and FREE Telegram backup/restore.
+School Academic Management Mini App — Premium Edition (Hardened)
+================================================================
+Telegram Mini App with verified Telegram auth, open registration
+(students self-register, teachers await approval), admin-created
+assessments (name + max only), and FREE Telegram backup/restore.
 """
 
 from flask import Flask, request, jsonify, render_template_string, has_request_context
@@ -12,6 +13,11 @@ import os
 import shutil
 import re
 import json
+import hmac
+import hashlib
+import urllib.parse
+import threading
+import time
 from datetime import datetime
 
 try:
@@ -23,8 +29,13 @@ app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-me-in-production-please")
 
 DB = os.environ.get("DB_PATH", "bot_database.db")
-ADMIN_ID = str(os.environ.get("ADMIN_ID", "440321906"))
+ADMIN_ID = str(os.environ.get("ADMIN_ID", "")).strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ALLOW_ID_FALLBACK = os.environ.get("ALLOW_ID_FALLBACK", "0") == "1"
+AUTO_BACKUP = os.environ.get("AUTO_BACKUP", "1") == "1"
+
+BACKUP_MARKER = DB + ".last_backup"
+MAX_RESTORE_BYTES = 50 * 1024 * 1024  # 50 MB
 
 
 # ============================================================
@@ -61,7 +72,13 @@ def now():
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _year_part_from_name(name, fallback):
+    m = re.search(r"(20\d{2})", str(name or ""))
+    return m.group(1) if m else str(fallback)
+
+
 def ensure_registration_codes():
+    """Create a registration code for any class that lacks one. Safe to call repeatedly."""
     with connect() as c:
         classes = c.execute("""
             SELECT c.id, c.grade, c.section, c.academic_year_id, y.name AS year_name
@@ -72,12 +89,7 @@ def ensure_registration_codes():
         """).fetchall()
 
         for row in classes:
-            yearpart = str(row["academic_year_id"])
-            if row["year_name"]:
-                m = re.search(r"(20\d{2})", str(row["year_name"]))
-                if m:
-                    yearpart = m.group(1)
-
+            yearpart = _year_part_from_name(row["year_name"], row["academic_year_id"])
             base = f"G{row['grade']}{row['section']}-{yearpart}"
             code = base
             n = 2
@@ -86,31 +98,40 @@ def ensure_registration_codes():
             ).fetchone():
                 code = f"{base}-{n}"
                 n += 1
-
-            c.execute(
-                """INSERT INTO section_registration_codes
-                   (class_id, code, status, created_at)
-                   VALUES (?, ?, 'active', ?)""",
-                (row["id"], code, now()),
-            )
+            try:
+                c.execute(
+                    """INSERT INTO section_registration_codes
+                       (class_id, code, status, created_at)
+                       VALUES (?, ?, 'active', ?)""",
+                    (row["id"], code, now()),
+                )
+            except sqlite3.IntegrityError:
+                # Someone else inserted concurrently — fine, skip.
+                pass
         c.commit()
 
 
 def migrate_db():
+    """Idempotent, safe schema migrations."""
     try:
         with connect() as c:
-            try:
-                c.execute("SELECT description FROM lessons LIMIT 1")
-            except sqlite3.OperationalError:
-                c.execute("ALTER TABLE lessons ADD COLUMN description TEXT")
+            # Add columns to lessons if missing
+            for col, ddl in (
+                ("description", "ALTER TABLE lessons ADD COLUMN description TEXT"),
+                ("created_at",  "ALTER TABLE lessons ADD COLUMN created_at TEXT"),
+            ):
+                try:
+                    c.execute(f"SELECT {col} FROM lessons LIMIT 1")
+                except sqlite3.OperationalError:
+                    try:
+                        c.execute(ddl)
+                    except sqlite3.OperationalError:
+                        pass
 
-            try:
-                c.execute("SELECT created_at FROM lessons LIMIT 1")
-            except sqlite3.OperationalError:
-                c.execute("ALTER TABLE lessons ADD COLUMN created_at TEXT")
-
+            # Drop legacy columns from academic_assessments if present
             try:
                 c.execute("SELECT assessment_type_id FROM academic_assessments LIMIT 1")
+                # column exists — rebuild table without it
                 c.execute("ALTER TABLE academic_assessments RENAME TO academic_assessments_old")
                 c.execute("""
                     CREATE TABLE academic_assessments (
@@ -143,6 +164,7 @@ def migrate_db():
             except sqlite3.OperationalError:
                 pass
 
+            # Ensure announcements table exists
             try:
                 c.execute("SELECT 1 FROM announcements LIMIT 1")
             except sqlite3.OperationalError:
@@ -298,6 +320,15 @@ def init_db():
                     created_by TEXT,
                     created_at TEXT
                 );
+
+                CREATE INDEX IF NOT EXISTS idx_results_assessment
+                    ON results(assessment_id);
+                CREATE INDEX IF NOT EXISTS idx_results_student
+                    ON results(student_telegram_id);
+                CREATE INDEX IF NOT EXISTS idx_students_class
+                    ON students(class_id);
+                CREATE INDEX IF NOT EXISTS idx_assignments_teacher
+                    ON teacher_assignments(teacher_telegram_id);
             """)
             c.commit()
             print("✓ Database initialized")
@@ -306,16 +337,71 @@ def init_db():
 
 
 # ============================================================
-# AUTH HELPERS
+# AUTH — Telegram initData verification
 # ============================================================
 
+def verify_telegram_init_data(init_data: str):
+    """Verify Telegram WebApp initData using HMAC-SHA256. Returns user dict or None."""
+    if not init_data or not BOT_TOKEN:
+        return None
+    try:
+        parsed = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
+    except Exception:
+        return None
+
+    received_hash = parsed.pop("hash", None)
+    if not received_hash:
+        return None
+
+    data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(parsed.items()))
+    secret_key = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    calculated = hmac.new(
+        secret_key, data_check_string.encode(), hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(calculated, received_hash):
+        return None
+
+    # Freshness check (24h)
+    try:
+        auth_date = int(parsed.get("auth_date", "0"))
+        if auth_date and (datetime.now().timestamp() - auth_date) > 86400:
+            return None
+    except Exception:
+        pass
+
+    user_json = parsed.get("user")
+    if not user_json:
+        return None
+    try:
+        return json.loads(user_json)
+    except Exception:
+        return None
+
+
 def uid():
+    """Return verified Telegram user id, or '' if not authenticated."""
     if not has_request_context():
         return ""
-    return str(request.args.get("id", "")).strip()
+
+    init_data = (
+        request.headers.get("X-Telegram-Init-Data")
+        or request.args.get("initData")
+        or ""
+    )
+    user = verify_telegram_init_data(init_data)
+    if user and user.get("id"):
+        return str(user["id"])
+
+    if ALLOW_ID_FALLBACK:
+        return str(request.args.get("id", "")).strip()
+
+    return ""
 
 
 def is_admin():
+    if not ADMIN_ID:
+        return False
     return uid() == ADMIN_ID
 
 
@@ -332,11 +418,12 @@ def get_role():
             "SELECT status FROM teachers WHERE telegram_id = ?", (user_id,)
         )
         if teacher:
-            if teacher.get("status") == "approved":
+            status = teacher.get("status")
+            if status == "approved":
                 return "teacher"
-            if teacher.get("status") == "pending":
+            if status == "pending":
                 return "pending_teacher"
-            if teacher.get("status") == "rejected":
+            if status == "rejected":
                 return "rejected_teacher"
             return "teacher"
     except Exception as e:
@@ -348,6 +435,10 @@ def require_admin():
     return is_admin()
 
 
+def _owner_match(row, user_id):
+    return bool(row and str(row["teacher_telegram_id"]) == str(user_id))
+
+
 def teacher_owns_assignment(assignment_id, user_id):
     if is_admin():
         return True
@@ -355,7 +446,7 @@ def teacher_owns_assignment(assignment_id, user_id):
         "SELECT teacher_telegram_id FROM teacher_assignments WHERE id = ?",
         (assignment_id,),
     )
-    return row and str(row["teacher_telegram_id"]) == str(user_id)
+    return _owner_match(row, user_id)
 
 
 def teacher_owns_lesson(lesson_id, user_id):
@@ -367,7 +458,7 @@ def teacher_owns_lesson(lesson_id, user_id):
         JOIN teacher_assignments ta ON ta.id = l.teacher_assignment_id
         WHERE l.id = ?
     """, (lesson_id,))
-    return row and str(row["teacher_telegram_id"]) == str(user_id)
+    return _owner_match(row, user_id)
 
 
 def teacher_owns_assessment(assessment_id, user_id):
@@ -379,17 +470,16 @@ def teacher_owns_assessment(assessment_id, user_id):
         JOIN teacher_assignments ta ON ta.id = aa.teacher_assignment_id
         WHERE aa.id = ?
     """, (assessment_id,))
-    return row and str(row["teacher_telegram_id"]) == str(user_id)
+    return _owner_match(row, user_id)
 
 
 # ============================================================
-# TELEGRAM HELPERS (free backup storage)
+# TELEGRAM HELPERS
 # ============================================================
 
 def send_telegram_document(chat_id, file_path, caption=""):
-    """Send a file to a Telegram chat using Bot API. Returns (ok, message)."""
     if not BOT_TOKEN:
-        return False, "BOT_TOKEN is not set. Add it in Render Environment variables."
+        return False, "BOT_TOKEN is not set."
     if requests is None:
         return False, "requests library missing. Add 'requests' to requirements.txt"
     if not os.path.isfile(file_path):
@@ -429,15 +519,32 @@ def send_telegram_message(chat_id, text):
         return False
 
 
+def mark_backup_sent():
+    try:
+        with open(BACKUP_MARKER, "w") as fh:
+            fh.write(now())
+    except OSError:
+        pass
+
+
+def last_backup_time():
+    if not os.path.isfile(BACKUP_MARKER):
+        return None
+    try:
+        with open(BACKUP_MARKER) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
 # ============================================================
 # HOME
 # ============================================================
 
 @app.route("/")
 def home():
+    # Always render the app — the JS decides what to show based on role.
     role = get_role()
-    # Always render the main app. Unregistered users get the registration UI.
-    # Admin is recognized purely by ADMIN_ID (no registration needed).
     return render_template_string(
         HTML,
         user_id=uid() or "",
@@ -626,10 +733,8 @@ def save(name):
 
     try:
         with connect() as c:
-            if name == "students":
-                return jsonify(error="Students register themselves via the bot."), 403
-            if name == "teachers":
-                return jsonify(error="Teachers register themselves via the bot."), 403
+            if name in ("students", "teachers"):
+                return jsonify(error="Self-registration only. Use the Register screen."), 403
 
             if name == "school_classes":
                 if role != "admin":
@@ -643,13 +748,16 @@ def save(name):
                     return jsonify(error="Section must contain letters only."), 400
                 if not year_id:
                     return jsonify(error="Academic year is required"), 400
-                if not one("SELECT id FROM academic_years WHERE id = ?", (year_id,)):
+                year_row = c.execute(
+                    "SELECT name FROM academic_years WHERE id = ?", (year_id,)
+                ).fetchone()
+                if not year_row:
                     return jsonify(error="Academic year not found"), 400
                 class_name = f"Grade {grade}{section}"
-                if one(
+                if c.execute(
                     "SELECT id FROM school_classes WHERE name = ? AND academic_year_id = ?",
                     (class_name, year_id),
-                ):
+                ).fetchone():
                     return jsonify(error="This class already exists in that academic year."), 400
                 cur = c.execute(
                     """INSERT INTO school_classes
@@ -658,9 +766,7 @@ def save(name):
                     (class_name, grade, section, year_id, created),
                 )
                 class_id = cur.lastrowid
-                yearrow = one("SELECT name FROM academic_years WHERE id = ?", (year_id,))
-                m = re.search(r"(20\d{2})", str(yearrow.get("name") if yearrow else ""))
-                yearpart = m.group(1) if m else str(year_id)
+                yearpart = _year_part_from_name(year_row["name"], year_id)
                 base = f"G{grade}{section}-{yearpart}"
                 code = base
                 n = 2
@@ -682,9 +788,13 @@ def save(name):
                 code = str(d.get("code", "")).strip() or None
                 if not subject_name:
                     return jsonify(error="Subject name is required"), 400
-                if one("SELECT id FROM subjects WHERE LOWER(name) = LOWER(?)", (subject_name,)):
+                if c.execute(
+                    "SELECT id FROM subjects WHERE LOWER(name) = LOWER(?)", (subject_name,)
+                ).fetchone():
                     return jsonify(error="This subject already exists."), 400
-                if code and one("SELECT id FROM subjects WHERE code = ?", (code,)):
+                if code and c.execute(
+                    "SELECT id FROM subjects WHERE code = ?", (code,)
+                ).fetchone():
                     return jsonify(error="This subject code already exists."), 400
                 c.execute(
                     "INSERT INTO subjects (name, code, status, created_at) VALUES (?, ?, 'active', ?)",
@@ -700,7 +810,9 @@ def save(name):
                 status = d.get("status") or "planned"
                 if not year_name:
                     return jsonify(error="Academic year name is required"), 400
-                if one("SELECT id FROM academic_years WHERE LOWER(name) = LOWER(?)", (year_name,)):
+                if c.execute(
+                    "SELECT id FROM academic_years WHERE LOWER(name) = LOWER(?)", (year_name,)
+                ).fetchone():
                     return jsonify(error="This academic year already exists."), 400
                 if status == "active":
                     c.execute("UPDATE academic_years SET status = 'planned'")
@@ -720,26 +832,26 @@ def save(name):
                 year_id = d.get("academic_year_id")
                 if not all([teacher, subject, class_id, year_id]):
                     return jsonify(error="All fields are required"), 400
-                teacher_row = one(
+                teacher_row = c.execute(
                     "SELECT telegram_id, status FROM teachers WHERE telegram_id = ?",
                     (teacher,),
-                )
+                ).fetchone()
                 if not teacher_row:
                     return jsonify(error="Teacher is not registered."), 400
                 if teacher_row["status"] != "approved":
                     return jsonify(error="Teacher is not approved yet."), 400
-                if not one("SELECT id FROM subjects WHERE id = ?", (subject,)):
+                if not c.execute("SELECT id FROM subjects WHERE id = ?", (subject,)).fetchone():
                     return jsonify(error="Subject not found"), 400
-                if not one("SELECT id FROM school_classes WHERE id = ?", (class_id,)):
+                if not c.execute("SELECT id FROM school_classes WHERE id = ?", (class_id,)).fetchone():
                     return jsonify(error="Class not found"), 400
-                if not one("SELECT id FROM academic_years WHERE id = ?", (year_id,)):
+                if not c.execute("SELECT id FROM academic_years WHERE id = ?", (year_id,)).fetchone():
                     return jsonify(error="Academic year not found"), 400
-                if one(
+                if c.execute(
                     """SELECT id FROM teacher_assignments
                        WHERE teacher_telegram_id = ? AND subject_id = ?
                          AND class_id = ? AND academic_year_id = ?""",
                     (teacher, subject, class_id, year_id),
-                ):
+                ).fetchone():
                     return jsonify(error="This teacher is already assigned to this subject and class."), 400
                 c.execute(
                     """INSERT INTO teacher_assignments
@@ -780,9 +892,11 @@ def save(name):
                     return jsonify(error="Class assignment is required"), 400
                 if not title:
                     return jsonify(error="Assessment name is required"), 400
-                if max_score <= 0 or max_score > 100:
-                    return jsonify(error="Out of % must be between 0.01 and 100."), 400
-                if not one("SELECT id FROM teacher_assignments WHERE id = ?", (assignment_id,)):
+                if max_score <= 0:
+                    return jsonify(error="Max score must be greater than 0."), 400
+                if not c.execute(
+                    "SELECT id FROM teacher_assignments WHERE id = ?", (assignment_id,)
+                ).fetchone():
                     return jsonify(error="Invalid assignment"), 400
                 c.execute(
                     """INSERT INTO academic_assessments
@@ -886,10 +1000,7 @@ def delete(name, item_id):
                         SELECT id FROM teacher_assignments WHERE class_id = ?)""", (class_id,))
                 c.execute("DELETE FROM teacher_assignments WHERE class_id = ?", (class_id,))
                 c.execute("UPDATE students SET class_id = NULL, class_name = '' WHERE class_id = ?", (class_id,))
-                try:
-                    c.execute("DELETE FROM section_registration_codes WHERE class_id = ?", (class_id,))
-                except sqlite3.OperationalError:
-                    pass
+                c.execute("DELETE FROM section_registration_codes WHERE class_id = ?", (class_id,))
                 c.execute("DELETE FROM school_classes WHERE id = ?", (class_id,))
                 c.commit()
                 return jsonify(ok=True)
@@ -938,6 +1049,10 @@ def delete(name, item_id):
                     DELETE FROM lessons WHERE teacher_assignment_id IN (
                         SELECT id FROM teacher_assignments WHERE academic_year_id = ?)""", (year_id,))
                 c.execute("DELETE FROM teacher_assignments WHERE academic_year_id = ?", (year_id,))
+                # Clean up codes for classes being removed
+                c.execute("""
+                    DELETE FROM section_registration_codes WHERE class_id IN (
+                        SELECT id FROM school_classes WHERE academic_year_id = ?)""", (year_id,))
                 c.execute("DELETE FROM school_classes WHERE academic_year_id = ?", (year_id,))
                 c.execute("DELETE FROM academic_years WHERE id = ?", (year_id,))
                 c.commit()
@@ -1042,15 +1157,14 @@ def teacher_status(teacher_id):
 
 
 # ============================================================
-# SELF-REGISTRATION (open to everyone with Telegram ID)
+# SELF-REGISTRATION
 # ============================================================
 
 @app.route("/api/register/student", methods=["POST"])
 def register_student():
-    """Students self-register using a section registration code."""
     user_id = uid()
     if not user_id:
-        return jsonify(error="Telegram ID is required. Open the app from Telegram."), 401
+        return jsonify(error="Please open the app from Telegram."), 401
     if user_id == ADMIN_ID:
         return jsonify(error="Admin account cannot register as student."), 400
     if one("SELECT 1 FROM students WHERE telegram_id = ?", (user_id,)):
@@ -1075,10 +1189,10 @@ def register_student():
     if not code:
         return jsonify(error="Registration code is required (ask your school for the class code)."), 400
 
-    # Find class by registration code
     ensure_registration_codes()
     rc = one("""
-        SELECT rc.class_id, rc.status, c.name AS class_name, c.academic_year_id, c.grade, c.section
+        SELECT rc.class_id, rc.status, c.name AS class_name,
+               c.academic_year_id, c.grade, c.section
         FROM section_registration_codes rc
         JOIN school_classes c ON c.id = rc.class_id
         WHERE UPPER(rc.code) = ?
@@ -1088,7 +1202,6 @@ def register_student():
     if rc.get("status") != "active":
         return jsonify(error="This registration code is no longer active."), 400
 
-    # Optional uniqueness of student_id
     if student_id:
         existing = one("SELECT telegram_id FROM students WHERE student_id = ?", (student_id,))
         if existing and str(existing["telegram_id"]) != str(user_id):
@@ -1101,7 +1214,7 @@ def register_student():
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             user_id,
-            student_id or user_id,  # fallback to telegram id if no student_id given
+            student_id or user_id,
             name,
             sex or None,
             rc["class_id"],
@@ -1122,10 +1235,9 @@ def register_student():
 
 @app.route("/api/register/teacher", methods=["POST"])
 def register_teacher():
-    """Teachers self-register; status starts as pending until admin approves."""
     user_id = uid()
     if not user_id:
-        return jsonify(error="Telegram ID is required. Open the app from Telegram."), 401
+        return jsonify(error="Please open the app from Telegram."), 401
     if user_id == ADMIN_ID:
         return jsonify(error="Admin account cannot register as teacher."), 400
     if one("SELECT 1 FROM teachers WHERE telegram_id = ?", (user_id,)):
@@ -1158,10 +1270,9 @@ def register_teacher():
             phone,
             now(),
         ))
-        # Notify admin (optional, free)
         send_telegram_message(
             ADMIN_ID,
-            f"👨‍🏫 New teacher registration pending approval:\n"
+            f"👨🏫 New teacher registration pending approval:\n"
             f"Name: {name}\n"
             f"TG ID: {user_id}\n"
             f"Teacher ID: {teacher_id or user_id}\n"
@@ -1180,7 +1291,6 @@ def register_teacher():
 
 @app.route("/api/register/status")
 def register_status():
-    """Lightweight check so the frontend knows what to show."""
     user_id = uid()
     if not user_id:
         return jsonify(registered=False, role=None, message="No Telegram ID")
@@ -1241,9 +1351,8 @@ def assessment_students():
         LEFT JOIN results r
                ON r.student_telegram_id = st.telegram_id AND r.assessment_id = ?
         WHERE st.class_id = ?
-          AND (st.academic_year_id = ? OR st.academic_year_id IS NULL OR ? IS NULL)
         ORDER BY st.name
-    """, (assessment_id, assignment["class_id"], assignment["academic_year_id"], assignment["academic_year_id"]))
+    """, (assessment_id, assignment["class_id"]))
 
     return jsonify(assignment=assignment, assessment=assessment, students=students)
 
@@ -1284,7 +1393,6 @@ def assessment_feed():
         c = sqlite3.connect(DB, timeout=30)
         c.row_factory = sqlite3.Row
         try:
-            c.execute("PRAGMA foreign_keys = OFF")
             c.execute("BEGIN")
             for entry in scores:
                 telegram_id = str(entry.get("telegram_id") or "").strip()
@@ -1497,7 +1605,12 @@ def teacher_api():
         WHERE ta.teacher_telegram_id = ?
         ORDER BY aa.assessment_date DESC, aa.id DESC
     """, (user_id,))
-    return jsonify({"teacher": teacher, "assignments": assignments, "messages": messages, "assessments": assessments})
+    return jsonify({
+        "teacher": teacher,
+        "assignments": assignments,
+        "messages": messages,
+        "assessments": assessments,
+    })
 
 
 # ============================================================
@@ -1651,7 +1764,6 @@ def my_announcements():
 
 @app.route("/api/backup")
 def backup():
-    """Create a local timestamped copy of the database."""
     if not require_admin():
         return jsonify(error="Unauthorized"), 403
     try:
@@ -1666,11 +1778,12 @@ def backup():
 
 @app.route("/api/backup/telegram", methods=["POST"])
 def backup_to_telegram():
-    """Send the current database file to the admin's Telegram chat (FREE storage)."""
     if not require_admin():
         return jsonify(error="Unauthorized"), 403
     if not BOT_TOKEN:
         return jsonify(error="BOT_TOKEN is not set. Add it in Render → Environment."), 400
+    if not ADMIN_ID:
+        return jsonify(error="ADMIN_ID is not set."), 400
     if not os.path.isfile(DB):
         return jsonify(error="Database file not found on server"), 404
 
@@ -1683,19 +1796,21 @@ def backup_to_telegram():
     )
     ok, msg = send_telegram_document(ADMIN_ID, DB, caption)
     if ok:
+        mark_backup_sent()
         return jsonify(ok=True, message=msg)
     return jsonify(error=msg), 500
 
 
+REQUIRED_TABLES = {
+    "students", "teachers", "school_classes",
+    "teacher_assignments", "academic_assessments", "results",
+}
+
+
 @app.route("/api/restore", methods=["POST"])
 def restore_database():
-    """
-    Restore database from an uploaded .db file.
-    Admin downloads the backup from Telegram, then uploads it here.
-    """
     if not require_admin():
         return jsonify(error="Unauthorized"), 403
-
     if "file" not in request.files:
         return jsonify(error="No file uploaded. Choose a .db backup file."), 400
 
@@ -1704,39 +1819,64 @@ def restore_database():
         return jsonify(error="Empty file"), 400
 
     filename = f.filename.lower()
-    if not (filename.endswith(".db") or filename.endswith(".sqlite") or filename.endswith(".sqlite3")):
+    if not filename.endswith((".db", ".sqlite", ".sqlite3")):
         return jsonify(error="File must be a .db (SQLite) backup"), 400
 
-    # Safety: save to a temp path first, then replace
+    # Size guard
+    f.stream.seek(0, os.SEEK_END)
+    size = f.stream.tell()
+    f.stream.seek(0)
+    if size > MAX_RESTORE_BYTES:
+        return jsonify(error=f"Backup file too large (max {MAX_RESTORE_BYTES // (1024*1024)} MB)."), 400
+
     tmp_path = DB + ".restore_tmp"
     try:
         f.save(tmp_path)
-        # Quick validation: try opening as SQLite
-        test = sqlite3.connect(tmp_path)
-        test.execute("SELECT 1")
-        test.close()
 
-        # Replace live database
-        # Close any potential locks by using a new name then rename
-        bak_path = DB + ".before_restore"
+        # Validate the uploaded file is a real SQLite DB with expected tables
+        test = sqlite3.connect(tmp_path)
+        try:
+            test.execute("SELECT 1")
+            tables = {r[0] for r in test.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()}
+            missing = REQUIRED_TABLES - tables
+            if missing:
+                raise ValueError(
+                    "Not a valid school backup (missing tables: "
+                    + ", ".join(sorted(missing)) + ")"
+                )
+        finally:
+            test.close()
+
+        # Backup current, then swap in the restored DB
         if os.path.isfile(DB):
-            shutil.copy2(DB, bak_path)
+            shutil.copy2(DB, DB + ".before_restore")
         shutil.move(tmp_path, DB)
 
         # Run migrations on the restored DB
         migrate_db()
+        try:
+            ensure_registration_codes()
+        except Exception as e:
+            print(f"post-restore ensure_registration_codes: {e}")
+
+        # Clean up the safety copy on success
+        try:
+            os.remove(DB + ".before_restore")
+        except OSError:
+            pass
 
         send_telegram_message(
             ADMIN_ID,
-            f"✅ Database restored successfully at {now()}\n"
-            f"Previous copy kept as .before_restore on server (temporary)."
+            f"✅ Database restored successfully at {now()}",
         )
         return jsonify(ok=True, message="Database restored successfully. Reload the page.")
     except Exception as e:
         if os.path.isfile(tmp_path):
             try:
                 os.remove(tmp_path)
-            except Exception:
+            except OSError:
                 pass
         return jsonify(error=f"Restore failed: {e}"), 500
 
@@ -1756,60 +1896,58 @@ def backup_status():
         path=DB,
         bot_token_set=bool(BOT_TOKEN),
         admin_id=ADMIN_ID,
+        last_backup=last_backup_time(),
+        auto_backup=AUTO_BACKUP,
     )
 
 
 # ============================================================
-# UNAUTHORIZED PAGE
+# AUTO BACKUP THREAD
 # ============================================================
 
-UNAUTHORIZED_HTML = r"""
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-  <title>School Academic</title>
-  <script src="https://telegram.org/js/telegram-web-app.js"></script>
-  <style>
-    :root { --bg:#06080f; --card:#121826; --border:#1e293b; --text:#f1f5f9; --muted:#64748b; --accent:#22d3ee; }
-    *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
-    .card{background:linear-gradient(165deg,#151b2d,#0c1220);border:1px solid var(--border);border-radius:24px;padding:2.5rem 2rem;max-width:380px;width:100%;text-align:center;box-shadow:0 25px 50px -12px rgb(0 0 0/.6)}
-    .icon{width:64px;height:64px;margin:0 auto 1.25rem;background:linear-gradient(135deg,#0e7490,#6366f1);border-radius:18px;display:grid;place-items:center;font-size:28px}
-    h1{font-size:1.5rem;margin-bottom:.5rem;font-weight:700}
-    p{color:var(--muted);font-size:.95rem;line-height:1.55;margin:.4rem 0}
-    .id{font-family:ui-monospace,monospace;background:#0a0e17;padding:.4rem .75rem;border-radius:8px;font-size:.8rem;color:var(--accent);display:inline-block;margin-top:.75rem}
-  </style>
-</head>
-<body>
-  <div class="card">
-    <div class="icon">🔒</div>
-    <h1>Access Required</h1>
-    <p>Please open this app from the Telegram bot after registration.</p>
-    <p class="id">ID: {{ user_id }}</p>
-  </div>
-  <script>
-    if (window.Telegram && Telegram.WebApp) {
-      Telegram.WebApp.ready();
-      Telegram.WebApp.expand();
-      const u = Telegram.WebApp.initDataUnsafe?.user;
-      if (u && u.id) {
-        const url = new URL(window.location.href);
-        if (!url.searchParams.get("id")) {
-          url.searchParams.set("id", String(u.id));
-          window.location.replace(url.toString());
-        }
-      }
-    }
-  </script>
-</body>
-</html>
-"""
+def _auto_backup_loop():
+    time.sleep(45)  # let the app warm up
+    last_sent_day = None
+    while True:
+        try:
+            today = datetime.now().strftime("%Y-%m-%d")
+            if (
+                today != last_sent_day
+                and BOT_TOKEN
+                and ADMIN_ID
+                and os.path.isfile(DB)
+            ):
+                ok, msg = send_telegram_document(
+                    ADMIN_ID,
+                    DB,
+                    f"🗓️ Automatic daily backup — {now()}\n"
+                    f"Save this in Saved Messages to be safe.",
+                )
+                if ok:
+                    mark_backup_sent()
+                    last_sent_day = today
+                    print(f"[auto-backup] sent for {today}")
+                else:
+                    print(f"[auto-backup] failed: {msg}")
+        except Exception as e:
+            print(f"[auto-backup] error: {e}")
+        time.sleep(3600)  # re-check hourly
+
+
+def start_auto_backup():
+    if not AUTO_BACKUP:
+        print("Auto-backup disabled (AUTO_BACKUP=0)")
+        return
+    if not (BOT_TOKEN and ADMIN_ID):
+        print("Auto-backup skipped (BOT_TOKEN or ADMIN_ID missing)")
+        return
+    t = threading.Thread(target=_auto_backup_loop, daemon=True)
+    t.start()
+    print("✓ Auto-backup thread started")
 
 
 # ============================================================
-# PREMIUM HTML FRONTEND
+# HTML (Premium UI)
 # ============================================================
 
 HTML = r"""
@@ -1837,13 +1975,12 @@ body{font-family:var(--font);background:var(--bg);color:var(--text);line-height:
 header{background:linear-gradient(180deg,#0c1220,#0a0e17);padding:14px 18px;position:sticky;top:0;z-index:60;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:12px;backdrop-filter:blur(12px)}
 .logo{width:36px;height:36px;background:linear-gradient(135deg,#0e7490,#4f46e5);border-radius:11px;display:grid;place-items:center;font-size:16px;box-shadow:0 4px 14px rgba(14,116,144,.35);flex-shrink:0}
 header h1{font-size:1.1rem;font-weight:700;letter-spacing:-.02em;background:linear-gradient(90deg,#f1f5f9,#94a3b8);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text}
-nav{display:flex!important;gap:6px;overflow-x:auto;background:var(--bg2);padding:10px 12px;position:sticky;top:57px;z-index:50;border-bottom:1px solid var(--border);scrollbar-width:none;visibility:visible!important;opacity:1!important;min-height:44px}
+nav{display:flex!important;gap:6px;overflow-x:auto;background:var(--bg2);padding:10px 12px;position:sticky;top:57px;z-index:50;border-bottom:1px solid var(--border);scrollbar-width:none;min-height:44px}
 nav::-webkit-scrollbar{display:none}
-nav button{background:transparent;color:var(--muted);border:1px solid transparent;border-radius:999px;padding:8px 14px;white-space:nowrap;font-weight:600;font-size:12.5px;cursor:pointer;transition:all .18s;font-family:inherit;visibility:visible!important;opacity:1!important}
+nav button{background:transparent;color:var(--muted);border:1px solid transparent;border-radius:999px;padding:8px 14px;white-space:nowrap;font-weight:600;font-size:12.5px;cursor:pointer;transition:all .18s;font-family:inherit}
 nav button:hover{color:var(--text2);background:var(--card)}
-nav button.active{background:linear-gradient(135deg,#0e7490,#6366f1);color:#fff;border-color:transparent;box-shadow:0 4px 12px rgba(99,102,241,.3)}
-main{max-width:720px;margin:0 auto;padding:16px 14px 90px;visibility:visible!important;opacity:1!important;min-height:40vh}
-.card,.hero,.tablewrap,table,.lesson,.grid,.stat{visibility:visible!important;opacity:1!important}
+nav button.active{background:linear-gradient(135deg,#0e7490,#6366f1);color:#fff;box-shadow:0 4px 12px rgba(99,102,241,.3)}
+main{max-width:720px;margin:0 auto;padding:16px 14px 90px;min-height:40vh}
 .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:14px;box-shadow:var(--shadow);transition:border-color .2s}
 .card:hover{border-color:var(--border-light)}
 .hero{background:linear-gradient(145deg,#151b2d 0%,#1a1040 50%,#0c1220 100%);border-radius:20px;padding:22px 20px;margin-bottom:16px;border:1px solid rgba(99,102,241,.2);position:relative;overflow:hidden}
@@ -1854,7 +1991,7 @@ main{max-width:720px;margin:0 auto;padding:16px 14px 90px;visibility:visible!imp
 @media(min-width:560px){.grid{grid-template-columns:repeat(4,1fr)}}
 .stat{text-align:center;padding:16px 10px}
 .stat .muted{font-size:11px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:4px}
-.num,.number{font-size:1.7rem;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:-.03em}
+.num{font-size:1.7rem;font-weight:800;background:linear-gradient(135deg,var(--accent),var(--accent2));-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;letter-spacing:-.03em}
 .muted{color:var(--muted);font-size:13px}
 h2{margin:0 0 12px;font-size:1.2rem;font-weight:700}
 h3{margin:0 0 10px;font-size:1rem;font-weight:650;color:var(--text2)}
@@ -1897,10 +2034,9 @@ tr:hover td{background:rgba(255,255,255,.02)}
 footer{text-align:center;padding:18px 14px 28px;color:#475569;font-size:11.5px;border-top:1px solid var(--border);margin-top:12px}
 footer b{color:var(--muted)}
 .score-input{width:100px!important;margin:0!important;text-align:center;font-weight:650}
-#app{animation:fadeIn .25s ease}
-@keyframes fadeIn{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:translateY(0)}}
 .info-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;margin:12px 0;font-size:13px;line-height:1.55;color:var(--text2)}
 .info-box b{color:var(--accent)}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:var(--accent-dim);color:var(--accent);font-size:11px;font-weight:650;border:1px solid rgba(34,211,238,.25)}
 </style>
 </head>
 <body>
@@ -1914,6 +2050,7 @@ footer b{color:var(--muted)}
 <div id="toast" class="toast"></div>
 
 <script>
+/* ========== Telegram init ========== */
 (function initTelegram() {
   if (window.Telegram && Telegram.WebApp) {
     const tg = Telegram.WebApp;
@@ -1935,16 +2072,22 @@ footer b{color:var(--muted)}
 
 const ID   = {{ user_id|tojson }};
 const ROLE = {{ user_role|tojson }};
+const INIT_DATA = (window.Telegram && Telegram.WebApp && Telegram.WebApp.initData) || "";
 
 function api(url, options = {}) {
   const sep = url.includes("?") ? "&" : "?";
-  return fetch(url + sep + "id=" + encodeURIComponent(ID), options)
-    .then(async res => {
-      let data = {};
-      try { data = await res.json(); } catch (_) {}
-      if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
-      return data;
-    });
+  return fetch(url + sep + "id=" + encodeURIComponent(ID), {
+    ...options,
+    headers: {
+      ...(options.headers || {}),
+      "X-Telegram-Init-Data": INIT_DATA,
+    },
+  }).then(async res => {
+    let data = {};
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) throw new Error(data.error || ("Request failed (" + res.status + ")"));
+    return data;
+  });
 }
 
 function esc(v) {
@@ -1997,6 +2140,7 @@ function showError(e) {
      <button class="alt" onclick="location.reload()">Reload</button></div>`;
 }
 
+/* ========== Admin pages ========== */
 async function adminDashboard() {
   try {
     const d = await api("/api/dashboard");
@@ -2022,7 +2166,7 @@ async function adminDashboard() {
         <b style="font-size:1.1rem;margin-top:4px;display:inline-block">${esc(d.active_year?.name || "Not set")}</b>
       </div>
       ${d.bot_token_set
-        ? `<div class="info-box">✅ Telegram backup is configured. Use <b>Backup</b> tab to save data to your Telegram.</div>`
+        ? `<div class="info-box">✅ Telegram backup is configured. Go to <b>Backup</b> to save data to your Telegram.</div>`
         : `<div class="info-box">⚠️ <b>BOT_TOKEN</b> not set. Add it in Render → Environment to enable free Telegram backups.</div>`}`;
   } catch (e) { showError(e); }
 }
@@ -2300,7 +2444,7 @@ async function lessons() {
     box.innerHTML = data.map(x => `
       <div class="lesson">
         <b>📩 ${esc(x.title || "Message")}</b>
-        👨‍🏫 ${esc(x.teacher_name || "—")} · 📚 ${esc(x.subject_name || "—")}<br>
+        👨🏫 ${esc(x.teacher_name || "—")} · 📚 ${esc(x.subject_name || "—")}<br>
         🏫 Grade ${esc(x.grade || "—")}${esc(x.section || "")} · 📅 ${esc(x.lesson_date || "—")}
         ${x.description ? `<div class="muted" style="margin-top:6px">${esc(x.description)}</div>` : ""}
       </div>`).join("");
@@ -2410,7 +2554,7 @@ async function assessments() {
   try {
     const [data, o] = await Promise.all([api("/api/table/academic_assessments"), api("/api/options")]);
     document.getElementById("app").innerHTML = `
-      <div class="hero"><h2>Assessments</h2><p>Create assessments with a name and max score only</p></div>
+      <div class="hero"><h2>Assessments</h2><p>Create assessments with just a name and max score</p></div>
       <div class="card">
         <h3>Create Assessment</h3>
         <form onsubmit="createAssessment(event)">
@@ -2424,7 +2568,7 @@ async function assessments() {
               </select>
             </div>
             <div><label>Assessment Name</label><input name="title" placeholder="e.g. Mid-term Exam" required></div>
-            <div><label>Out of %</label><input name="max_score" type="number" min="0.01" max="100" step="0.01" value="100" required></div>
+            <div><label>Max Score</label><input name="max_score" type="number" min="1" step="1" value="100" required></div>
             <div><label>Date</label><input name="assessment_date" type="date" value="${new Date().toISOString().slice(0,10)}"></div>
           </div>
           <button>📝 Create Assessment</button>
@@ -2493,9 +2637,9 @@ async function runReport() {
     document.getElementById("reportOutput").innerHTML = `
       <div class="grid">
         <div class="card stat"><div class="muted">School Average</div>
-          <div class="number">${d.school_average == null ? "—" : d.school_average.toFixed(1) + "%"}</div></div>
+          <div class="num">${d.school_average == null ? "—" : d.school_average.toFixed(1) + "%"}</div></div>
         <div class="card stat"><div class="muted">Students Ranked</div>
-          <div class="number">${d.ranking.length}</div></div>
+          <div class="num">${d.ranking.length}</div></div>
       </div>
       <div class="card">
         <h3>Student Ranking</h3>
@@ -2513,10 +2657,14 @@ async function runReport() {
   } catch (e) { showError(e); }
 }
 
-/* ========== BACKUP (Telegram + Restore) ========== */
+/* ========== BACKUP ========== */
 async function backup() {
-  let status = { bot_token_set: false, size_kb: 0, exists: false };
+  let status = { bot_token_set: false, size_kb: 0, exists: false, last_backup: null, auto_backup: false };
   try { status = await api("/api/backup/status"); } catch(_){}
+
+  const last = status.last_backup
+    ? `<b style="color:var(--success)">${esc(status.last_backup)}</b>`
+    : `<b style="color:var(--warning)">Never</b>`;
 
   document.getElementById("app").innerHTML = `
     <div class="hero">
@@ -2531,10 +2679,14 @@ async function backup() {
           ? `Size: <b>${status.size_kb} KB</b> · Path: ${esc(status.path || "—")}`
           : "No database file found yet."}
       </p>
+      <p class="muted" style="margin-top:6px">Last backup: ${last}</p>
       <p class="muted" style="margin-top:6px">
         Telegram backup: ${status.bot_token_set
           ? '<span style="color:var(--success)">✅ Ready</span>'
           : '<span style="color:var(--warning)">⚠️ BOT_TOKEN missing</span>'}
+        · Auto-backup: ${status.auto_backup
+          ? '<span style="color:var(--success)">✅ On (daily)</span>'
+          : '<span class="muted">Off</span>'}
       </p>
     </div>
 
@@ -2563,8 +2715,8 @@ async function backup() {
       <b>How free Telegram storage works</b><br>
       1. Click “Send Database to My Telegram” → file arrives in your chat.<br>
       2. Forward it to <b>Saved Messages</b> so it never disappears.<br>
-      3. If Render restarts and data is lost, download the file and use Restore.<br>
-      4. Do this regularly (e.g. after important changes).
+      3. Auto-backup sends one automatically each day (if enabled).<br>
+      4. If Render restarts and data is lost, download the file and Restore.
     </div>
   `;
 }
@@ -2574,6 +2726,7 @@ async function sendBackupToTelegram() {
     toast("Sending backup to Telegram…");
     const r = await api("/api/backup/telegram", { method: "POST" });
     toast(r.message || "Backup sent! Check your Telegram.");
+    backup();
   } catch (e) {
     toast(e.message);
   }
@@ -2592,9 +2745,9 @@ async function restoreFromFile() {
 
   try {
     toast("Restoring database…");
-    const sep = "?";
-    const res = await fetch("/api/restore" + sep + "id=" + encodeURIComponent(ID), {
+    const res = await fetch("/api/restore?id=" + encodeURIComponent(ID), {
       method: "POST",
+      headers: { "X-Telegram-Init-Data": INIT_DATA },
       body: fd
     });
     const data = await res.json().catch(() => ({}));
@@ -2616,6 +2769,7 @@ async function deleteItem(name, id, label) {
   } catch (e) { toast(e.message); }
 }
 
+/* ========== Student ========== */
 async function studentHome() {
   try {
     const [d, ann] = await Promise.all([
@@ -2655,13 +2809,14 @@ async function studentHome() {
       <div class="card"><h3>Messages from Teachers</h3>
         ${d.lessons.length ? d.lessons.map(x => `
           <div class="lesson"><b>📨 ${esc(x.title)}</b>
-            👨‍🏫 ${esc(x.teacher_name)} · 📚 ${esc(x.subject_name)}
+            👨🏫 ${esc(x.teacher_name)} · 📚 ${esc(x.subject_name)}
             ${x.description ? `<div class="muted" style="margin-top:4px">${esc(x.description)}</div>` : ""}
           </div>`).join("") : "<p class='empty'>No messages yet.</p>"}
       </div>`;
   } catch (e) { showError(e); }
 }
 
+/* ========== Teacher ========== */
 async function teacherHome() {
   try {
     const [d, ann] = await Promise.all([
@@ -2672,9 +2827,9 @@ async function teacherHome() {
     document.getElementById("app").innerHTML = `
       <div class="hero"><h2>Teacher Dashboard</h2><p>Welcome back, ${esc(t.name)}</p></div>
       <div class="grid">
-        <div class="card stat"><div class="muted">Classes</div><div class="number">${d.assignments.length}</div></div>
-        <div class="card stat"><div class="muted">Messages</div><div class="number">${d.messages.length}</div></div>
-        <div class="card stat"><div class="muted">Assessments</div><div class="number">${d.assessments.length}</div></div>
+        <div class="card stat"><div class="muted">Classes</div><div class="num">${d.assignments.length}</div></div>
+        <div class="card stat"><div class="muted">Messages</div><div class="num">${d.messages.length}</div></div>
+        <div class="card stat"><div class="muted">Assessments</div><div class="num">${d.assessments.length}</div></div>
       </div>
       ${(ann.announcements || []).length ? `
       <div class="card"><h3>📢 School Announcements</h3>
@@ -2696,7 +2851,7 @@ async function teacherHome() {
       </div>
       <div class="card"><h3>Recent Assessments</h3>
         ${d.assessments.slice(0,3).map(x => `
-          <div class="lesson"><b>${esc(x.title)}</b> (${esc(x.max_score)}%)
+          <div class="lesson"><b>${esc(x.title)}</b> (max ${esc(x.max_score)})
             <div style="margin-top:8px">
               <button onclick="feedScores('${esc(x.id)}','${esc(x.teacher_assignment_id)}')">Enter Scores</button>
             </div>
@@ -2768,7 +2923,7 @@ async function teacherAssessments() {
       <div class="card"><h3>Assigned Assessments</h3>
         ${(d.assessments || []).length ? d.assessments.map(x => `
           <div class="lesson">
-            <b>📝 ${esc(x.title)}</b> (${esc(x.max_score)}%)
+            <b>📝 ${esc(x.title)}</b> (max ${esc(x.max_score)})
             <div class="muted">📚 ${esc(x.subject_name)} · 🏫 Grade ${esc(x.grade)}${esc(x.section)} · 📅 ${esc(x.assessment_date || "—")}</div>
             <div style="margin-top:8px">
               <button onclick="feedScores('${esc(x.id)}','${esc(x.teacher_assignment_id)}')">📝 Enter Scores</button>
@@ -2786,12 +2941,12 @@ async function feedScores(assessmentId, assignmentId) {
       <div class="hero">
         <h2>Enter Scores</h2>
         <p><b>${esc(data.assessment.title || "Assessment")}</b><br>
-          🏫 ${esc(data.assignment.class_name)} · 📚 ${esc(data.assignment.subject_name)} · Out of <b>${esc(maxScore)}</b></p>
+          🏫 ${esc(data.assignment.class_name)} · 📚 ${esc(data.assignment.subject_name)} · Max <b>${esc(maxScore)}</b></p>
       </div>
       <div class="card">
         <form onsubmit="saveScores(event, '${esc(assessmentId)}')">
           <div class="tablewrap"><table>
-            <thead><tr><th>Student</th><th>ID</th><th>Score ( / ${esc(maxScore)})</th></tr></thead>
+            <thead><tr><th>Student</th><th>ID</th><th>Score (/ ${esc(maxScore)})</th></tr></thead>
             <tbody>${data.students.length ? data.students.map(s => `
               <tr>
                 <td><b>${esc(s.name)}</b></td>
@@ -2841,13 +2996,13 @@ async function saveScores(e, assessmentId) {
 }
 
 const adminSections = {
-  dashboard: "📊 Dashboard", students: "👨‍🎓 Students", teachers: "👨‍🏫 Teachers",
+  dashboard: "📊 Dashboard", students: "👨🎓 Students", teachers: "👨🏫 Teachers",
   classes: "🏫 Classes", subjects: "📚 Subjects", assignments: "🔗 Assignments",
   lessons: "📨 Class Msgs", announcements: "📢 Broadcast", assessments: "📝 Assessments",
   years: "📅 Years", reports: "📈 Reports", backup: "💾 Backup"
 };
 
-/* ========== REGISTRATION UI (open to everyone) ========== */
+/* ========== Registration UI ========== */
 function showRegisterChoice() {
   document.getElementById("nav").innerHTML = "";
   document.getElementById("app").innerHTML = `
@@ -2856,10 +3011,10 @@ function showRegisterChoice() {
       <p>Choose how you want to join the school system</p>
     </div>
     <div class="card" style="text-align:center;padding:28px 20px">
-      <p class="muted" style="margin-bottom:18px">Your Telegram ID will become your account ID after registration.</p>
+      <p class="muted" style="margin-bottom:18px">Your Telegram ID becomes your account after registration.</p>
       <div style="display:flex;flex-direction:column;gap:12px;max-width:280px;margin:0 auto">
-        <button onclick="showStudentRegister()" style="padding:16px">👨‍🎓 Register as Student</button>
-        <button class="alt" onclick="showTeacherRegister()" style="padding:16px">👨‍🏫 Register as Teacher</button>
+        <button onclick="showStudentRegister()" style="padding:16px">👨🎓 Register as Student</button>
+        <button class="alt" onclick="showTeacherRegister()" style="padding:16px">👨🏫 Register as Teacher</button>
       </div>
       <p class="muted" style="margin-top:20px;font-size:12px">
         Students register instantly with a class code.<br>
@@ -2899,7 +3054,7 @@ function showStudentRegister() {
             <input name="registration_code" placeholder="e.g. G6A-2024" required
               style="text-transform:uppercase;letter-spacing:1px;font-weight:650">
             <p class="muted" style="font-size:11px;margin-top:2px">
-              Ask your school / class teacher for the code of your section.
+              Ask your class teacher or school admin for the code of your section.
             </p>
           </div>
         </div>
@@ -2998,7 +3153,6 @@ function showPendingTeacher() {
       <p>Your teacher registration is waiting for admin approval</p>
     </div>
     <div class="card" style="text-align:center;padding:28px 20px">
-      <div class="icon" style="margin:0 auto 16px;width:56px;height:56px;background:var(--warning-bg);border-radius:16px;display:grid;place-items:center;font-size:24px">⏳</div>
       <p>You have successfully registered as a teacher.</p>
       <p class="muted" style="margin-top:10px">Please wait until the school admin approves your account.<br>
       You will be able to use the app after approval.</p>
@@ -3020,27 +3174,42 @@ function showRejectedTeacher() {
 }
 
 /* ========== BOOT ========== */
-if (ROLE === "admin") {
-  setNav(Object.entries(adminSections));
-  show("dashboard");
-} else if (ROLE === "student") {
-  setNav([["studentHome", "🏠 Dashboard"]]);
-  show("studentHome");
-} else if (ROLE === "teacher") {
-  setNav([
-    ["teacherHome", "👨‍🏫 Dashboard"],
-    ["teacherMessages", "📨 Messages"],
-    ["teacherAssessments", "📝 Assessments"]
-  ]);
-  show("teacherHome");
-} else if (ROLE === "pending_teacher") {
-  showPendingTeacher();
-} else if (ROLE === "rejected_teacher") {
-  showRejectedTeacher();
-} else {
-  // No role yet → open registration (works for any visitor with Telegram ID)
+(async function boot() {
+  if (!ID) {
+    showRegisterChoice();
+    return;
+  }
+  let status = { registered: false, role: null };
+  try { status = await api("/api/register/status"); } catch (_) {}
+  if (status.role === "admin") {
+    setNav(Object.entries(adminSections));
+    show("dashboard");
+    return;
+  }
+  if (status.role === "student") {
+    setNav([["studentHome", "🏠 Dashboard"]]);
+    show("studentHome");
+    return;
+  }
+  if (status.role === "teacher" && status.status === "approved") {
+    setNav([
+      ["teacherHome", "👨🏫 Dashboard"],
+      ["teacherMessages", "📨 Messages"],
+      ["teacherAssessments", "📝 Assessments"]
+    ]);
+    show("teacherHome");
+    return;
+  }
+  if (status.role === "teacher" && status.status === "pending") {
+    showPendingTeacher();
+    return;
+  }
+  if (status.role === "teacher" && status.status === "rejected") {
+    showRejectedTeacher();
+    return;
+  }
   showRegisterChoice();
-}
+})();
 </script>
 </body>
 </html>
@@ -3052,21 +3221,27 @@ if (ROLE === "admin") {
 # ============================================================
 
 if __name__ == "__main__":
-    if not os.path.exists(DB):
-        print("Creating new database…")
-        init_db()
-    else:
-        print("Database found — running migration…")
-        migrate_db()
+    print("━" * 55)
+    print("  School Academic Mini App — Premium (Hardened)")
+    print("  Built by Magnificent Technologies · Dagim Tariku")
+    print("━" * 55)
+    print(f"  Port            : {os.environ.get('PORT', 5000)}")
+    print(f"  Database        : {DB}")
+    print(f"  Admin ID        : {ADMIN_ID or '(not set — admin disabled)'}")
+    print(f"  BOT_TOKEN       : {'SET' if BOT_TOKEN else 'NOT SET'}")
+    print(f"  ID fallback     : {'ON (dev only)' if ALLOW_ID_FALLBACK else 'OFF (secure)'}")
+    print(f"  Auto-backup     : {'ON' if AUTO_BACKUP else 'OFF'}")
+    print("━" * 55)
+
+    # Always run init + migrate (both are idempotent now)
+    init_db()
+    migrate_db()
+    try:
+        ensure_registration_codes()
+    except Exception as e:
+        print(f"ensure_registration_codes on boot: {e}")
+
+    start_auto_backup()
 
     port = int(os.environ.get("PORT", 5000))
-    print("━" * 50)
-    print("  School Academic Mini App — Premium Edition")
-    print("  Built by Magnificent Technologies · Dagim Tariku")
-    print("━" * 50)
-    print(f"  Port       : {port}")
-    print(f"  Database   : {DB}")
-    print(f"  Admin ID   : {ADMIN_ID}")
-    print(f"  BOT_TOKEN  : {'SET' if BOT_TOKEN else 'NOT SET'}")
-    print("━" * 50)
     app.run(host="0.0.0.0", port=port, debug=False)
