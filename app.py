@@ -1201,6 +1201,23 @@ def register_status():
     return jsonify(registered=False, role=None)
 
 
+@app.route("/api/debug")
+def debug_info():
+    """Simple debug endpoint – useful after deployment."""
+    user_id = uid()
+    role = get_role()
+    return jsonify(
+        ok=True,
+        telegram_id=user_id or None,
+        role=role,
+        admin_id=ADMIN_ID,
+        is_admin=(user_id == ADMIN_ID),
+        bot_token_set=bool(BOT_TOKEN),
+        db_path=DB,
+        db_exists=os.path.isfile(DB),
+    )
+
+
 # ============================================================
 # ASSESSMENT STUDENTS & SCORE FEED
 # ============================================================
@@ -1918,31 +1935,56 @@ footer b{color:var(--muted)}
 <div id="toast" class="toast"></div>
 
 <script>
+// ============================================================
+// ROBUST TELEGRAM + ID HANDLING (works after deployment)
+// ============================================================
+let ID   = {{ user_id|tojson }} || "";
+let ROLE = {{ user_role|tojson }} || "";
+
+function getTelegramId() {
+  try {
+    if (window.Telegram && Telegram.WebApp && Telegram.WebApp.initDataUnsafe) {
+      const u = Telegram.WebApp.initDataUnsafe.user;
+      if (u && u.id) return String(u.id);
+    }
+  } catch (e) {}
+  // Fallback: from URL
+  try {
+    const p = new URLSearchParams(window.location.search);
+    if (p.get("id")) return p.get("id");
+  } catch (e) {}
+  return ID || "";
+}
+
 (function initTelegram() {
   if (window.Telegram && Telegram.WebApp) {
     const tg = Telegram.WebApp;
-    tg.ready();
-    tg.expand();
+    try { tg.ready(); } catch(_){}
+    try { tg.expand(); } catch(_){}
     try { tg.setHeaderColor('#0c1220'); } catch(_){}
     try { tg.setBackgroundColor('#06080f'); } catch(_){}
-    const user = tg.initDataUnsafe && tg.initDataUnsafe.user;
-    if (user && user.id) {
+    try { tg.enableClosingConfirmation(); } catch(_){}
+  }
+  // Always sync the real Telegram ID
+  const realId = getTelegramId();
+  if (realId && realId !== ID) {
+    ID = realId;
+    // Update URL without full reload if possible
+    try {
       const url = new URL(window.location.href);
-      if (!url.searchParams.get("id")) {
-        url.searchParams.set("id", String(user.id));
-        window.location.replace(url.toString());
-        return;
+      if (url.searchParams.get("id") !== realId) {
+        url.searchParams.set("id", realId);
+        window.history.replaceState({}, "", url.toString());
       }
-    }
+    } catch(_){}
   }
 })();
 
-const ID   = {{ user_id|tojson }};
-const ROLE = {{ user_role|tojson }};
-
 function api(url, options = {}) {
+  // Always use the latest ID (critical for registration after deploy)
+  const currentId = getTelegramId() || ID;
   const sep = url.includes("?") ? "&" : "?";
-  return fetch(url + sep + "id=" + encodeURIComponent(ID), options)
+  return fetch(url + sep + "id=" + encodeURIComponent(currentId), options)
     .then(async res => {
       let data = {};
       try { data = await res.json(); } catch (_) {}
@@ -2853,6 +2895,7 @@ const adminSections = {
 
 /* ========== REGISTRATION UI (open to everyone) ========== */
 function showRegisterChoice() {
+  const tid = getTelegramId() || ID || "not detected";
   document.getElementById("nav").innerHTML = "";
   document.getElementById("app").innerHTML = `
     <div class="hero">
@@ -2860,7 +2903,9 @@ function showRegisterChoice() {
       <p>Choose how you want to join the school system</p>
     </div>
     <div class="card" style="text-align:center;padding:28px 20px">
-      <p class="muted" style="margin-bottom:18px">Your Telegram ID will become your account ID after registration.</p>
+      <p class="muted" style="margin-bottom:8px">Your Telegram ID:</p>
+      <div class="code" style="margin-bottom:18px;display:inline-block">${esc(tid)}</div>
+      <p class="muted" style="margin-bottom:18px;font-size:12px">This will become your account ID after registration.</p>
       <div style="display:flex;flex-direction:column;gap:12px;max-width:280px;margin:0 auto">
         <button onclick="showStudentRegister()" style="padding:16px">👨‍🎓 Register as Student</button>
         <button class="alt" onclick="showTeacherRegister()" style="padding:16px">👨‍🏫 Register as Teacher</button>
@@ -2951,13 +2996,26 @@ function showTeacherRegister() {
 
 async function submitStudentRegister(e) {
   e.preventDefault();
+  const currentId = getTelegramId() || ID;
+  if (!currentId) {
+    toast("No Telegram ID found. Open the app from Telegram.");
+    return;
+  }
   const fd = new FormData(e.target);
   const payload = {
-    name: fd.get("name"),
+    name: (fd.get("name") || "").trim(),
     sex: fd.get("sex") || "",
-    student_id: fd.get("student_id") || "",
+    student_id: (fd.get("student_id") || "").trim(),
     registration_code: (fd.get("registration_code") || "").toUpperCase().trim()
   };
+  if (!payload.name || payload.name.length < 2) {
+    toast("Full name is required");
+    return;
+  }
+  if (!payload.registration_code) {
+    toast("Registration code is required");
+    return;
+  }
   try {
     toast("Registering…");
     const res = await api("/api/register/student", {
@@ -2966,20 +3024,34 @@ async function submitStudentRegister(e) {
       body: JSON.stringify(payload)
     });
     toast(res.message || "Registered successfully!");
-    setTimeout(() => location.reload(), 1200);
+    // Force clean reload with correct id
+    setTimeout(() => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("id", currentId);
+      window.location.replace(url.toString());
+    }, 1000);
   } catch (err) {
-    toast(err.message);
+    toast(err.message || "Registration failed");
   }
 }
 
 async function submitTeacherRegister(e) {
   e.preventDefault();
+  const currentId = getTelegramId() || ID;
+  if (!currentId) {
+    toast("No Telegram ID found. Open the app from Telegram.");
+    return;
+  }
   const fd = new FormData(e.target);
   const payload = {
-    name: fd.get("name"),
-    phone: fd.get("phone") || "",
-    teacher_id: fd.get("teacher_id") || ""
+    name: (fd.get("name") || "").trim(),
+    phone: (fd.get("phone") || "").trim(),
+    teacher_id: (fd.get("teacher_id") || "").trim()
   };
+  if (!payload.name || payload.name.length < 2) {
+    toast("Full name is required");
+    return;
+  }
   try {
     toast("Submitting…");
     const res = await api("/api/register/teacher", {
@@ -2988,9 +3060,13 @@ async function submitTeacherRegister(e) {
       body: JSON.stringify(payload)
     });
     toast(res.message || "Submitted for approval");
-    setTimeout(() => location.reload(), 1200);
+    setTimeout(() => {
+      const url = new URL(window.location.href);
+      url.searchParams.set("id", currentId);
+      window.location.replace(url.toString());
+    }, 1000);
   } catch (err) {
-    toast(err.message);
+    toast(err.message || "Registration failed");
   }
 }
 
@@ -3023,28 +3099,85 @@ function showRejectedTeacher() {
     </div>`;
 }
 
-/* ========== BOOT ========== */
-if (ROLE === "admin") {
-  setNav(Object.entries(adminSections));
-  show("dashboard");
-} else if (ROLE === "student") {
-  setNav([["studentHome", "🏠 Dashboard"]]);
-  show("studentHome");
-} else if (ROLE === "teacher") {
-  setNav([
-    ["teacherHome", "👨‍🏫 Dashboard"],
-    ["teacherMessages", "📨 Messages"],
-    ["teacherAssessments", "📝 Assessments"]
-  ]);
-  show("teacherHome");
-} else if (ROLE === "pending_teacher") {
-  showPendingTeacher();
-} else if (ROLE === "rejected_teacher") {
-  showRejectedTeacher();
-} else {
-  // No role yet → open registration (works for any visitor with Telegram ID)
-  showRegisterChoice();
+/* ========== BOOT (robust for production / Telegram Mini App) ========== */
+async function bootApp() {
+  // 1. Make sure we have the real Telegram ID
+  const realId = getTelegramId();
+  if (realId) ID = realId;
+
+  // 2. If we still have no ID, show a clear message + manual fallback
+  if (!ID) {
+    document.getElementById("nav").innerHTML = "";
+    document.getElementById("app").innerHTML = `
+      <div class="hero"><h2>Open from Telegram</h2>
+        <p>This app must be opened from the Telegram bot as a Mini App.</p>
+      </div>
+      <div class="card">
+        <p class="muted" style="margin-bottom:12px">If you are testing outside Telegram, enter your numeric Telegram ID below:</p>
+        <input id="manualId" placeholder="Your Telegram numeric ID" style="margin-bottom:12px">
+        <button onclick="
+          const v = document.getElementById('manualId').value.trim();
+          if (!v) return toast('Enter a valid Telegram ID');
+          const url = new URL(window.location.href);
+          url.searchParams.set('id', v);
+          window.location.replace(url.toString());
+        ">Continue</button>
+      </div>`;
+    return;
+  }
+
+  // 3. Always re-check role from the server (critical after deploy)
+  try {
+    const st = await api("/api/register/status");
+    if (st.registered) {
+      if (st.role === "admin") ROLE = "admin";
+      else if (st.role === "student") ROLE = "student";
+      else if (st.role === "teacher") {
+        ROLE = (st.status === "pending") ? "pending_teacher" :
+               (st.status === "rejected") ? "rejected_teacher" : "teacher";
+      }
+    } else {
+      ROLE = "";
+    }
+  } catch (e) {
+    console.warn("Status check failed:", e);
+    // keep whatever ROLE the server originally rendered
+  }
+
+  // 4. Route to the correct UI
+  if (ROLE === "admin") {
+    setNav(Object.entries(adminSections));
+    show("dashboard");
+  } else if (ROLE === "student") {
+    setNav([["studentHome", "🏠 Dashboard"]]);
+    show("studentHome");
+  } else if (ROLE === "teacher") {
+    setNav([
+      ["teacherHome", "👨‍🏫 Dashboard"],
+      ["teacherMessages", "📨 Messages"],
+      ["teacherAssessments", "📝 Assessments"]
+    ]);
+    show("teacherHome");
+  } else if (ROLE === "pending_teacher") {
+    showPendingTeacher();
+  } else if (ROLE === "rejected_teacher") {
+    showRejectedTeacher();
+  } else {
+    // Not registered yet → show registration choice
+    showRegisterChoice();
+  }
 }
+
+// Start the app
+bootApp().catch(err => {
+  console.error(err);
+  document.getElementById("app").innerHTML = `
+    <div class="card">
+      <h2>Something went wrong</h2>
+      <p class="muted">${esc(err.message || String(err))}</p>
+      <button class="alt" onclick="location.reload()">Reload</button>
+    </div>`;
+});
 </script>
 </body>
 </html>
