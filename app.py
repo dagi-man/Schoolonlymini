@@ -168,142 +168,142 @@ def migrate_db():
 
 
 def init_db():
+    """Create all tables one-by-one (reliable on Render / ephemeral disks)."""
+    tables = [
+        ("academic_years", """
+            CREATE TABLE IF NOT EXISTS academic_years (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                start_date TEXT,
+                end_date TEXT,
+                status TEXT DEFAULT 'planned',
+                created_at TEXT
+            )"""),
+        ("school_classes", """
+            CREATE TABLE IF NOT EXISTS school_classes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                grade TEXT NOT NULL,
+                section TEXT NOT NULL,
+                academic_year_id INTEGER,
+                status TEXT DEFAULT 'active',
+                created_at TEXT,
+                UNIQUE(name, academic_year_id)
+            )"""),
+        ("students", """
+            CREATE TABLE IF NOT EXISTS students (
+                telegram_id TEXT PRIMARY KEY,
+                student_id TEXT UNIQUE,
+                name TEXT NOT NULL,
+                sex TEXT,
+                class_id INTEGER,
+                class_name TEXT,
+                academic_year_id INTEGER,
+                created_at TEXT
+            )"""),
+        ("teachers", """
+            CREATE TABLE IF NOT EXISTS teachers (
+                telegram_id TEXT PRIMARY KEY,
+                teacher_id TEXT UNIQUE,
+                name TEXT NOT NULL,
+                phone TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TEXT
+            )"""),
+        ("subjects", """
+            CREATE TABLE IF NOT EXISTS subjects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                code TEXT UNIQUE,
+                status TEXT DEFAULT 'active',
+                created_at TEXT
+            )"""),
+        ("teacher_assignments", """
+            CREATE TABLE IF NOT EXISTS teacher_assignments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_telegram_id TEXT NOT NULL,
+                subject_id INTEGER NOT NULL,
+                class_id INTEGER NOT NULL,
+                academic_year_id INTEGER NOT NULL,
+                status TEXT DEFAULT 'active',
+                created_at TEXT,
+                UNIQUE(teacher_telegram_id, subject_id, class_id, academic_year_id)
+            )"""),
+        ("lessons", """
+            CREATE TABLE IF NOT EXISTS lessons (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_assignment_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                description TEXT,
+                lesson_date TEXT,
+                created_at TEXT
+            )"""),
+        ("academic_assessments", """
+            CREATE TABLE IF NOT EXISTS academic_assessments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                teacher_assignment_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                max_score REAL DEFAULT 100,
+                assessment_date TEXT,
+                created_at TEXT
+            )"""),
+        ("results", """
+            CREATE TABLE IF NOT EXISTS results (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                assessment_id INTEGER NOT NULL,
+                student_telegram_id TEXT NOT NULL,
+                score REAL,
+                entered_at TEXT,
+                UNIQUE(assessment_id, student_telegram_id)
+            )"""),
+        ("grading_rules", """
+            CREATE TABLE IF NOT EXISTS grading_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                minimum_score REAL,
+                maximum_score REAL,
+                grade TEXT,
+                point REAL,
+                status TEXT DEFAULT 'active',
+                created_at TEXT
+            )"""),
+        ("section_registration_codes", """
+            CREATE TABLE IF NOT EXISTS section_registration_codes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                class_id INTEGER NOT NULL UNIQUE,
+                code TEXT NOT NULL UNIQUE,
+                status TEXT DEFAULT 'active',
+                created_at TEXT
+            )"""),
+        ("announcements", """
+            CREATE TABLE IF NOT EXISTS announcements (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                body TEXT,
+                target_type TEXT NOT NULL,
+                target_id TEXT,
+                created_by TEXT,
+                created_at TEXT
+            )"""),
+    ]
+
+    created, failed = [], []
     try:
-        with connect() as c:
-            c.executescript("""
-                CREATE TABLE IF NOT EXISTS academic_years (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    start_date TEXT,
-                    end_date TEXT,
-                    status TEXT DEFAULT 'planned',
-                    created_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS school_classes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    grade TEXT NOT NULL,
-                    section TEXT NOT NULL,
-                    academic_year_id INTEGER,
-                    status TEXT DEFAULT 'active',
-                    created_at TEXT,
-                    UNIQUE(name, academic_year_id),
-                    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS students (
-                    telegram_id TEXT PRIMARY KEY,
-                    student_id TEXT UNIQUE,
-                    name TEXT NOT NULL,
-                    sex TEXT,
-                    class_id INTEGER,
-                    class_name TEXT,
-                    academic_year_id INTEGER,
-                    created_at TEXT,
-                    FOREIGN KEY (class_id) REFERENCES school_classes(id),
-                    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS teachers (
-                    telegram_id TEXT PRIMARY KEY,
-                    teacher_id TEXT UNIQUE,
-                    name TEXT NOT NULL,
-                    phone TEXT,
-                    status TEXT DEFAULT 'pending',
-                    created_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS subjects (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    code TEXT UNIQUE,
-                    status TEXT DEFAULT 'active',
-                    created_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS teacher_assignments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    teacher_telegram_id TEXT NOT NULL,
-                    subject_id INTEGER NOT NULL,
-                    class_id INTEGER NOT NULL,
-                    academic_year_id INTEGER NOT NULL,
-                    status TEXT DEFAULT 'active',
-                    created_at TEXT,
-                    UNIQUE(teacher_telegram_id, subject_id, class_id, academic_year_id),
-                    FOREIGN KEY (teacher_telegram_id) REFERENCES teachers(telegram_id),
-                    FOREIGN KEY (subject_id) REFERENCES subjects(id),
-                    FOREIGN KEY (class_id) REFERENCES school_classes(id),
-                    FOREIGN KEY (academic_year_id) REFERENCES academic_years(id)
-                );
-
-                CREATE TABLE IF NOT EXISTS lessons (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    teacher_assignment_id INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    lesson_date TEXT,
-                    created_at TEXT,
-                    FOREIGN KEY (teacher_assignment_id)
-                        REFERENCES teacher_assignments(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS academic_assessments (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    teacher_assignment_id INTEGER NOT NULL,
-                    title TEXT NOT NULL,
-                    max_score REAL DEFAULT 100,
-                    assessment_date TEXT,
-                    created_at TEXT,
-                    FOREIGN KEY (teacher_assignment_id)
-                        REFERENCES teacher_assignments(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS results (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    assessment_id INTEGER NOT NULL,
-                    student_telegram_id TEXT NOT NULL,
-                    score REAL,
-                    entered_at TEXT,
-                    UNIQUE(assessment_id, student_telegram_id),
-                    FOREIGN KEY (assessment_id)
-                        REFERENCES academic_assessments(id) ON DELETE CASCADE,
-                    FOREIGN KEY (student_telegram_id)
-                        REFERENCES students(telegram_id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS grading_rules (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL,
-                    minimum_score REAL,
-                    maximum_score REAL,
-                    grade TEXT,
-                    point REAL,
-                    status TEXT DEFAULT 'active',
-                    created_at TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS section_registration_codes (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    class_id INTEGER NOT NULL UNIQUE,
-                    code TEXT NOT NULL UNIQUE,
-                    status TEXT DEFAULT 'active',
-                    created_at TEXT,
-                    FOREIGN KEY (class_id) REFERENCES school_classes(id) ON DELETE CASCADE
-                );
-
-                CREATE TABLE IF NOT EXISTS announcements (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    title TEXT NOT NULL,
-                    body TEXT,
-                    target_type TEXT NOT NULL,
-                    target_id TEXT,
-                    created_by TEXT,
-                    created_at TEXT
-                );
-            """)
-            c.commit()
-            print("✓ Database initialized")
+        c = connect()
+        try:
+            for name, sql in tables:
+                try:
+                    c.execute(sql)
+                    c.commit()
+                    created.append(name)
+                except Exception as e:
+                    failed.append(f"{name}: {e}")
+                    print(f"  ⚠ table {name}: {e}")
+            print(f"✓ Database initialized ({len(created)}/12 tables)")
+            if failed:
+                print(f"  Failed tables: {failed}")
+        finally:
+            c.close()
     except Exception as e:
         print(f"Database initialization error: {e}")
 
@@ -1206,15 +1206,23 @@ def debug_info():
     """Simple debug endpoint – useful after deployment."""
     user_id = uid()
     role = get_role()
+    tables = []
+    try:
+        rows = all_rows("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
+        tables = [r["name"] for r in rows]
+    except Exception as e:
+        tables = [f"error: {e}"]
     return jsonify(
         ok=True,
         telegram_id=user_id or None,
         role=role,
         admin_id=ADMIN_ID,
-        is_admin=(user_id == ADMIN_ID),
+        is_admin=(str(user_id) == str(ADMIN_ID)),
         bot_token_set=bool(BOT_TOKEN),
         db_path=DB,
         db_exists=os.path.isfile(DB),
+        tables=tables,
+        table_count=len(tables),
     )
 
 
@@ -3196,12 +3204,13 @@ if __name__ == "__main__":
     except Exception:
         pass
 
-    if not os.path.exists(DB):
-        print("Creating new database…")
-        init_db()
-    else:
-        print("Database found — running migration…")
+    # Always ensure all tables exist (safe even if DB already exists)
+    print("Ensuring database tables…")
+    init_db()
+    try:
         migrate_db()
+    except Exception as e:
+        print(f"Migration warning: {e}")
 
     # Always ensure registration codes exist for any classes that lack them
     try:
